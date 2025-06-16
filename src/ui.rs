@@ -9,11 +9,19 @@ pub struct CancelCasterApp {
     noise_reduction: bool,
     input_level: f32,
     output_level: f32,
+    selected_input_device: usize,
+    selected_output_device: usize,
 }
 
 impl CancelCasterApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error>> {
         let audio_processor = Arc::new(Mutex::new(AudioProcessor::new()?));
+        
+        let (selected_input_device, selected_output_device) = if let Ok(processor) = audio_processor.lock() {
+            (processor.get_selected_input_index(), processor.get_selected_output_index())
+        } else {
+            (0, 0)
+        };
         
         Ok(Self {
             audio_processor,
@@ -22,6 +30,8 @@ impl CancelCasterApp {
             noise_reduction: true,
             input_level: 0.0,
             output_level: 0.0,
+            selected_input_device,
+            selected_output_device,
         })
     }
 }
@@ -66,6 +76,84 @@ impl eframe::App for CancelCasterApp {
                     if self.is_running { "Running" } else { "Stopped" }
                 );
             });
+
+            ui.separator();
+
+            // Device Selection
+            ui.heading("Audio Devices");
+            
+            // Get device info (clone to avoid borrowing issues)
+            let (input_devices, output_devices) = if let Ok(processor) = self.audio_processor.lock() {
+                (processor.get_input_devices().clone(), processor.get_output_devices().clone())
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            
+            let mut input_device_changed = None;
+            let mut output_device_changed = None;
+            
+            // Input device selection
+            ui.horizontal(|ui| {
+                ui.label("Input Device:");
+                
+                if !input_devices.is_empty() && self.selected_input_device < input_devices.len() {
+                    egui::ComboBox::from_id_source("input_device")
+                        .selected_text(&input_devices[self.selected_input_device].name)
+                        .show_ui(ui, |ui| {
+                            for (i, device_info) in input_devices.iter().enumerate() {
+                                let text = if device_info.is_default {
+                                    format!("{} (Default)", device_info.name)
+                                } else {
+                                    device_info.name.clone()
+                                };
+                                
+                                if ui.selectable_value(&mut self.selected_input_device, i, text).changed() {
+                                    input_device_changed = Some(i);
+                                }
+                            }
+                        });
+                }
+            });
+            
+            // Output device selection
+            ui.horizontal(|ui| {
+                ui.label("Output Device:");
+                
+                if !output_devices.is_empty() && self.selected_output_device < output_devices.len() {
+                    egui::ComboBox::from_id_source("output_device")
+                        .selected_text(&output_devices[self.selected_output_device].name)
+                        .show_ui(ui, |ui| {
+                            for (i, device_info) in output_devices.iter().enumerate() {
+                                let text = if device_info.is_default {
+                                    format!("{} (Default)", device_info.name)
+                                } else {
+                                    device_info.name.clone()
+                                };
+                                
+                                if ui.selectable_value(&mut self.selected_output_device, i, text).changed() {
+                                    output_device_changed = Some(i);
+                                }
+                            }
+                        });
+                }
+            });
+            
+            // Apply device changes
+            if let Some(index) = input_device_changed {
+                if let Ok(mut processor) = self.audio_processor.lock() {
+                    if let Err(e) = processor.set_input_device(index) {
+                        eprintln!("Failed to set input device: {}", e);
+                    }
+                }
+            }
+            
+            if let Some(index) = output_device_changed {
+                if let Ok(mut processor) = self.audio_processor.lock() {
+                    if let Err(e) = processor.set_output_device(index) {
+                        eprintln!("Failed to set output device: {}", e);
+                    }
+                }
+            }
 
             ui.separator();
 

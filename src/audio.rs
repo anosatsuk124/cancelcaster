@@ -6,11 +6,30 @@ use cpal::{
 use ringbuf::{HeapRb, Rb};
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info};
+use tracing::{error, info};
+
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+}
+
+impl DeviceInfo {
+    pub fn new(name: String, is_default: bool) -> Self {
+        Self { name, is_default }
+    }
+}
 
 pub struct AudioProcessor {
-    input_device: Option<Device>,
-    output_device: Option<Device>,
+    host: Host,
+    input_devices: Vec<Device>,
+    output_devices: Vec<Device>,
+    input_device_info: Vec<DeviceInfo>,
+    output_device_info: Vec<DeviceInfo>,
+    selected_input_device: Option<Device>,
+    selected_output_device: Option<Device>,
+    selected_input_index: usize,
+    selected_output_index: usize,
     loopback_device: Option<Device>,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
@@ -29,16 +48,53 @@ impl AudioProcessor {
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
         
-        let input_device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("No input device available"))?;
+        // Enumerate input devices
+        let mut input_devices = Vec::new();
+        let mut input_device_info = Vec::new();
+        let default_input = host.default_input_device();
+        let default_input_name = default_input.as_ref()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_else(|| "Unknown".to_string());
         
-        let output_device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("No output device available"))?;
-
-        info!("Input device: {}", input_device.name()?);
-        info!("Output device: {}", output_device.name()?);
+        for device in host.input_devices()? {
+            let device_name = device.name().unwrap_or_else(|_| "Unknown Device".to_string());
+            let is_default = device_name == default_input_name;
+            input_devices.push(device);
+            input_device_info.push(DeviceInfo::new(device_name, is_default));
+        }
+        
+        // Enumerate output devices
+        let mut output_devices = Vec::new();
+        let mut output_device_info = Vec::new();
+        let default_output = host.default_output_device();
+        let default_output_name = default_output.as_ref()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_else(|| "Unknown".to_string());
+        
+        for device in host.output_devices()? {
+            let device_name = device.name().unwrap_or_else(|_| "Unknown Device".to_string());
+            let is_default = device_name == default_output_name;
+            output_devices.push(device);
+            output_device_info.push(DeviceInfo::new(device_name, is_default));
+        }
+        
+        // Find default device indices
+        let selected_input_index = input_device_info.iter()
+            .position(|info| info.is_default)
+            .unwrap_or(0);
+        let selected_output_index = output_device_info.iter()
+            .position(|info| info.is_default)
+            .unwrap_or(0);
+        
+        let selected_input_device = input_devices.get(selected_input_index).cloned();
+        let selected_output_device = output_devices.get(selected_output_index).cloned();
+        
+        if let Some(ref device) = selected_input_device {
+            info!("Selected input device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+        }
+        if let Some(ref device) = selected_output_device {
+            info!("Selected output device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+        }
 
         let buffer_size = 48000; // 1 second at 48kHz
         let mic_buffer = Arc::new(Mutex::new(HeapRb::<f32>::new(buffer_size)));
@@ -46,8 +102,15 @@ impl AudioProcessor {
         let processed_buffer = Arc::new(Mutex::new(HeapRb::<f32>::new(buffer_size)));
 
         Ok(Self {
-            input_device: Some(input_device),
-            output_device: Some(output_device),
+            host,
+            input_devices,
+            output_devices,
+            input_device_info,
+            output_device_info,
+            selected_input_device,
+            selected_output_device,
+            selected_input_index,
+            selected_output_index,
             loopback_device: None,
             input_stream: None,
             output_stream: None,
@@ -64,7 +127,7 @@ impl AudioProcessor {
     }
 
     pub fn start_input_capture(&mut self) -> Result<()> {
-        if let Some(device) = &self.input_device {
+        if let Some(device) = &self.selected_input_device {
             let config = device.default_input_config()?;
             info!("Input config: {:?}", config);
             
@@ -231,7 +294,7 @@ impl AudioProcessor {
     }
 
     pub fn start_loopback_output(&mut self) -> Result<()> {
-        if let Some(device) = &self.output_device {
+        if let Some(device) = &self.selected_output_device {
             let config = device.default_output_config()?;
             let processed_buffer = Arc::clone(&self.processed_buffer);
             
@@ -303,6 +366,62 @@ impl AudioProcessor {
             }
         }
         0.0
+    }
+
+    pub fn get_input_devices(&self) -> &Vec<DeviceInfo> {
+        &self.input_device_info
+    }
+
+    pub fn get_output_devices(&self) -> &Vec<DeviceInfo> {
+        &self.output_device_info
+    }
+
+    pub fn get_selected_input_index(&self) -> usize {
+        self.selected_input_index
+    }
+
+    pub fn get_selected_output_index(&self) -> usize {
+        self.selected_output_index
+    }
+
+    pub fn set_input_device(&mut self, index: usize) -> Result<()> {
+        if index < self.input_devices.len() {
+            self.selected_input_index = index;
+            self.selected_input_device = self.input_devices.get(index).cloned();
+            
+            if self.is_processing {
+                // Stop current input stream if running
+                if let Some(stream) = self.input_stream.take() {
+                    drop(stream);
+                }
+                // Restart with new device
+                self.start_input_capture()?;
+            }
+            
+            info!("Input device changed to: {}", 
+                  self.input_device_info[index].name);
+        }
+        Ok(())
+    }
+
+    pub fn set_output_device(&mut self, index: usize) -> Result<()> {
+        if index < self.output_devices.len() {
+            self.selected_output_index = index;
+            self.selected_output_device = self.output_devices.get(index).cloned();
+            
+            if self.is_processing {
+                // Stop current output stream if running
+                if let Some(stream) = self.loopback_stream.take() {
+                    drop(stream);
+                }
+                // Restart with new device
+                self.start_loopback_output()?;
+            }
+            
+            info!("Output device changed to: {}", 
+                  self.output_device_info[index].name);
+        }
+        Ok(())
     }
 }
 
